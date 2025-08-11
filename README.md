@@ -6,6 +6,7 @@ Implémentation du jeu **Quantik** (4×4, règles officielles) en Python/PyQt5, 
 ```bash
 pip install -r requirements.txt
 python -m gui.app
+```
 
 ## Lancer le tournament entre IA
 ```bash
