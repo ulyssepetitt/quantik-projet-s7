@@ -1,22 +1,22 @@
-# Fichiers systèmes MacOS
+# Fichiers systèmes macOS
 .DS_Store
 
-# Cache et fichiers compilés Python
+# Cache/fichiers compilés Python
 __pycache__/
 *.py[cod]
 *$py.class
 
 # Environnements virtuels Python
+.venv/
 venv/
 env/
-.venv/
 
 # Fichiers temporaires
 *.log
 *.tmp
 
-# Fichiers de configuration locaux (ex: variables d'environnement, mots de passe)
+# Variables d'environnement locales (ne pas versionner des secrets)
 .env
 
-# Bases de données SQLite locales
+# Bases SQLite locales
 *.sqlite3
