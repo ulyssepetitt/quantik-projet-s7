@@ -1,20 +1,36 @@
-# tournament/runner_multi.py
+# tournament/runner.py
 # ----------------------------------------------------------
-# Tournoi IA vs IA avec agrégation multi-seeds.
-# - Détecte automatiquement les IA dans ai_players/*/algorithme.py
-# - Fait s'affronter chaque paire pour plusieurs seeds
-# - Mélange qui commence (P1/P2) et agrège les résultats
-# - Affiche taux de victoire et intervalle de confiance 95%
+# Tournoi IA vs IA (incluant self-play) sans interface GUI.
+# - Découverte automatique des IA dans ai_players/*/algorithme.py
+# - Matchs en aller/retour (alternance du premier joueur)
+# - Inclut les confrontations IA identiques (self-play)
+# - Seme aléatoire par match pour reproductibilité
+# - Statistiques: winrate + intervalle de confiance de Wilson
+# - Classement Elo approximatif
+# - Matrice de confrontations
+# - Export CSV optionnel (désactivé par défaut)
 # ----------------------------------------------------------
 
-import importlib, pkgutil, pathlib, random, math, time
+from __future__ import annotations
+import importlib, pkgutil, pathlib, random, time, math, csv
 from typing import List, Dict, Tuple
 from core.types import Shape, Player, Piece
 from core.rules import QuantikBoard
 
+# =======================
+# Paramètres du tournoi
+# =======================
+GAMES_PER_PAIR = 50          # nb de parties par confrontation (au total A vs B)
+INCLUDE_SELF_PLAY = True     # True => inclure IA vs elle-même
+BASE_SEED = 42               # graine globale
+CSV_LOG = False              # True => export CSV, sinon laissé commenté plus bas
+CSV_PATH = "tournament_results.csv"
 
-# ---------- Découverte des IA ----------
+# =======================
+# Découverte des IA
+# =======================
 def discover_ais():
+    """Retourne une liste [{name, cls}] des IA trouvées."""
     base_pkg = "ai_players"
     base_path = pathlib.Path(__file__).resolve().parents[1] / base_pkg
     ais = []
@@ -31,18 +47,39 @@ def discover_ais():
     ais.sort(key=lambda x: x["name"].lower())
     return ais
 
+# =======================
+# Utilitaires statistiques
+# =======================
+def wilson_interval(k: int, n: int, z: float = 1.96) -> Tuple[float, float, float]:
+    """Intervalle de Wilson pour une proportion k/n (95% si z=1.96)."""
+    if n == 0:
+        return 0.0, 0.0, 0.0
+    phat = k / n
+    denom = 1 + z*z/n
+    center = (phat + z*z/(2*n)) / denom
+    margin = (z * math.sqrt((phat*(1-phat) + z*z/(4*n)) / n)) / denom
+    return phat, max(0.0, center - margin), min(1.0, center + margin)
 
-# ---------- Moteur d’une partie (sans GUI) ----------
-def play_one_game(aiA_cls, aiB_cls, first: Player, seed: int) -> Player:
+def expected_score(elo_a: float, elo_b: float) -> float:
+    return 1.0 / (1.0 + 10 ** ((elo_b - elo_a) / 400.0))
+
+def update_elo(elo_a: float, elo_b: float, score_a: float, k: float = 20.0) -> Tuple[float,float]:
+    ea = expected_score(elo_a, elo_b)
+    eb = 1.0 - ea
+    return elo_a + k*(score_a - ea), elo_b + k*((1.0 - score_a) - eb)
+
+# =======================
+# Moteur de match
+# =======================
+def play_one_game(aiA_cls, aiB_cls, first: Player = Player.PLAYER1, seed: int = None) -> Player:
     """
-    Joue une partie IA vs IA.
-    - aiA = côté logique Player1, aiB = côté logique Player2
-    - first = qui commence effectivement (P1 ou P2)
-    - seed = graine pour rendre le match reproductible
-    Retourne le vainqueur (Player).
+    Joue une partie:
+      - aiA = Player1, aiB = Player2 (peu importe 'first', on alterne le droit de commencer)
+      - 'first' indique qui joue le premier coup effectif
+      - on passe 'board.board' aux IA (compatible GUI)
     """
-    # graine globale (pour les IA qui utilisent random)
-    random.seed(seed)
+    if seed is not None:
+        random.seed(seed)
 
     board = QuantikBoard()
     pieces = {
@@ -55,122 +92,137 @@ def play_one_game(aiA_cls, aiB_cls, first: Player, seed: int) -> Player:
     current = first
     while True:
         ai = aiA if current == Player.PLAYER1 else aiB
-        move = ai.get_move(board.raw(), pieces)
+        # NOTE: si votre QuantikBoard expose board.raw(), remplacez ci-dessous par board.raw()
+        move = ai.get_move(board.board, pieces)
         if not move:
-            # Aucun coup possible -> l’autre gagne
+            # pas de coup => l'autre gagne
             return Player.PLAYER2 if current == Player.PLAYER1 else Player.PLAYER1
 
         r, c, shape = move
-        ok = board.place_piece(r, c, Piece(shape, current))
-        if not ok:
-            # Coup illégal proposé -> perte immédiate
+        if not board.place_piece(r, c, Piece(shape, current)):
+            # coup invalide => défaite immédiate
             return Player.PLAYER2 if current == Player.PLAYER1 else Player.PLAYER1
 
-        # Décrémente le stock
         pieces[current][shape] -= 1
-
-        # Victoire ?
         if board.check_victory():
             return current
 
-        # Changement de joueur
+        # Alternance du joueur
         current = Player.PLAYER2 if current == Player.PLAYER1 else Player.PLAYER1
 
-
-# ---------- Statistiques ----------
-def ci95(p: float, n: int) -> Tuple[float, float]:
-    """Intervalle de confiance 95% (approx. normale). Retourne (low, high)."""
-    if n == 0:
-        return (0.0, 0.0)
-    err = 1.96 * math.sqrt(max(p * (1 - p) / n, 0.0))
-    return (max(0.0, p - err), min(1.0, p + err))
-
-
-# ---------- Tournoi multi-seeds ----------
-def run_tournament(games_per_seed: int = 10, seeds: List[int] = None):
+def play_pair(iaA, iaB, games: int, base_seed: int) -> Tuple[int,int,float]:
     """
-    Pour chaque paire (A,B):
-      - pour chaque seed:
-          - joue `games_per_seed` parties
-          - alterne le joueur qui commence (P1/P2)
-      - agrège les résultats
+    Joue 'games' parties entre iaA et iaB, en alternant le premier joueur.
+    Retourne (winsA, winsB, elapsed_seconds).
     """
-    if seeds is None:
-        seeds = [101, 202, 303, 404, 505]  # modifiez/ajoutez si besoin
+    t0 = time.time()
+    winsA = winsB = 0
+    for g in range(games):
+        first = Player.PLAYER1 if (g % 2 == 0) else Player.PLAYER2
+        # Seed reprod. dépendante des noms + index de partie
+        seed = (hash((iaA["name"], iaB["name"])) ^ (base_seed + g)) & 0x7FFFFFFF
+        winner = play_one_game(iaA["cls"], iaB["cls"], first, seed)
+        # Attribution: si winner == côté qui a "l'identité" de A ?
+        # Ici, A est toujours Player1 par construction du moteur play_one_game,
+        # mais 'first' peut être P1 ou P2. On s'en moque: winner est un Player.
+        if winner == Player.PLAYER1:
+            # Player1 est l'IA A
+            winsA += 1
+        else:
+            winsB += 1
+    elapsed = time.time() - t0
+    return winsA, winsB, elapsed
+
+# =======================
+# Tournoi complet
+# =======================
+def main():
+    random.seed(BASE_SEED)
 
     ais = discover_ais()
     names = [a["name"] for a in ais]
     print(f"IAs découvertes ({len(ais)}): {names}")
 
-    # tableau des résultats agrégés: (A,B) -> dict
-    results: Dict[Tuple[str, str], Dict[str, int]] = {}
+    if CSV_LOG:
+        # Entête CSV (désactivez CSV_LOG=False si vous voulez réellement écrire le fichier)
+        with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["A", "B", "games", "winsA", "winsB", "wrA", "ci_low", "ci_high", "seconds"])
 
+    # Stats cumulées
+    agg = {a["name"]: {"W": 0, "L": 0} for a in ais}
+    # Elo
+    elo = {a["name"]: 1000.0 for a in ais}
+    # Matrice (A bat B)
+    matrix = {a["name"]: {b["name"]: (0,0) for b in ais} for a in ais}
+
+    # Boucle de confrontations (y compris self-play si demandé)
     for i in range(len(ais)):
-        for j in range(i + 1, len(ais)):
-            A, B = ais[i], ais[j]
-            key = (A["name"], B["name"])
-            stats = {"A_wins": 0, "B_wins": 0, "total": 0}
-            t0 = time.time()
+        for j in range(len(ais)):
+            if i < j or (i == j and INCLUDE_SELF_PLAY):
+                A, B = ais[i], ais[j]
+                winsA, winsB, elapsed = play_pair(A, B, GAMES_PER_PAIR, BASE_SEED)
 
-            # multi-seeds
-            for seed in seeds:
-                # on répartit le droit de commencer à parts égales
-                for g in range(games_per_seed):
-                    # pour reproductibilité par partie: mélange seed + indices
-                    game_seed = seed * 10_000 + g
+                # Winrate + IC
+                wr, lo, hi = wilson_interval(winsA, winsA + winsB)
 
-                    # partie 1: A commence
-                    winner = play_one_game(A["cls"], B["cls"], Player.PLAYER1, game_seed + 1)
-                    stats["total"] += 1
-                    if winner == Player.PLAYER1:
-                        stats["A_wins"] += 1
-                    else:
-                        stats["B_wins"] += 1
+                # Elo (mise à jour bilatérale, score = wins/total)
+                # NB: sur un batch, on peut faire une seule mise à jour agrégée
+                scoreA = winsA / max(1, (winsA + winsB))
+                elo[A["name"]], elo[B["name"]] = update_elo(elo[A["name"]], elo[B["name"]], scoreA, k=24.0)
 
-                    # partie 2: B commence
-                    winner = play_one_game(A["cls"], B["cls"], Player.PLAYER2, game_seed + 2)
-                    stats["total"] += 1
-                    if winner == Player.PLAYER1:
-                        stats["A_wins"] += 1
-                    else:
-                        stats["B_wins"] += 1
+                # Agrégation
+                agg[A["name"]]["W"] += winsA
+                agg[A["name"]]["L"] += winsB
+                agg[B["name"]]["W"] += winsB
+                agg[B["name"]]["L"] += winsA
 
-            results[key] = stats
-            # Affichage pair par pair avec IC
-            A_w, B_w, T = stats["A_wins"], stats["B_wins"], stats["total"]
-            pA = A_w / T if T else 0.0
-            lo, hi = ci95(pA, T)
-            dt = time.time() - t0
-            print(
-                f"{A['name']} vs {B['name']} -> {A_w}-{B_w} sur {T} | "
-                f"WR(A)={pA:.3f} (95% CI: {lo:.3f}-{hi:.3f}) | {dt:.1f}s"
-            )
+                # Matrice
+                matrix[A["name"]][B["name"]] = (winsA, winsB)
 
-    # Résumé final style “classement” grossier : tri par winrate cumulé
+                # Affichage par duel
+                print(f"{A['name']} vs {B['name']} -> {winsA}-{winsB} sur {GAMES_PER_PAIR} "
+                      f"| WR(A)={wr:.3f} (95% CI: {lo:.3f}-{hi:.3f}) | {elapsed:.1f}s")
+
+                # CSV (optionnel)
+                if CSV_LOG:
+                    with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
+                        w = csv.writer(f)
+                        w.writerow([A["name"], B["name"], GAMES_PER_PAIR, winsA, winsB,
+                                    f"{wr:.3f}", f"{lo:.3f}", f"{hi:.3f}", f"{elapsed:.3f}"])
+
+    # Résumé agrégé
     print("\n=== Résumé agrégé par IA (winrate cumulé) ===")
-    cum = {name: {"wins": 0, "loss": 0} for name in names}
-    for (a_name, b_name), st in results.items():
-        A_w, B_w = st["A_wins"], st["B_wins"]
-        cum[a_name]["wins"] += A_w
-        cum[a_name]["loss"] += B_w
-        cum[b_name]["wins"] += B_w
-        cum[b_name]["loss"] += A_w
-
-    table = []
+    rows = []
     for name in names:
-        w, l = cum[name]["wins"], cum[name]["loss"]
-        t = w + l
-        wr = w / t if t else 0.0
-        table.append((wr, w, l, name))
-    table.sort(reverse=True)
+        W, L = agg[name]["W"], agg[name]["L"]
+        wr, lo, hi = wilson_interval(W, W+L) if (W+L)>0 else (0.0,0.0,0.0)
+        rows.append((name, W, L, wr, lo, hi))
+    rows.sort(key=lambda x: x[3], reverse=True)
+    for (name, W, L, wr, lo, hi) in rows:
+        print(f"{name:<28} {W:>4}-{L:<4}  WR={wr:.3f}  (95% CI {lo:.3f}-{hi:.3f})")
 
-    for wr, w, l, name in table:
-        lo, hi = ci95(wr, w + l)
-        print(f"{name:25s}  {w:4d}-{l:<4d}  WR={wr:.3f}  (95% CI {lo:.3f}-{hi:.3f})")
+    # Classement Elo (approx.)
+    print("\n=== Classement ELO (approx.) ===")
+    for name, rating in sorted(elo.items(), key=lambda x: x[1], reverse=True):
+        print(f"{name:<26} ELO={rating:.1f}")
 
+    # Matrice
+    print("\n=== Matrice de confrontations (A bat B) ===")
+    # En-tête
+    header = "                         | " + " | ".join(f"{n[:12]:>12}" for n in names)
+    print(header)
+    print("-" * len(header))
+    for a in names:
+        line = f"{a[:25]:<25} | "
+        for b in names:
+            wA, wB = matrix[a][b]
+            if a == b and not INCLUDE_SELF_PLAY:
+                cell = "   —   "
+            else:
+                cell = f"{wA:>2}-{wB:<2}"
+            line += f"{cell:>12} | "
+        print(line)
 
 if __name__ == "__main__":
-    # Ajustez ces paramètres si nécessaire:
-    # - games_per_seed = combien de *paires* de parties par seed (2 parties par paire: A commence / B commence)
-    # - seeds = liste de graines pour stabiliser les résultats
-    run_tournament(games_per_seed=5, seeds=[101, 202, 303, 404, 505])
+    main()
