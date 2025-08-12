@@ -1,40 +1,56 @@
 # tournament/runner.py
 # ----------------------------------------------------------
-# Tournoi IA vs IA (incluant self-play) sans interface GUI.
-# - Découverte automatique des IA dans ai_players/*/algorithme.py
-# - Matchs en aller/retour (alternance du premier joueur)
-# - Inclut les confrontations IA identiques (self-play)
-# - Seme aléatoire par match pour reproductibilité
-# - Statistiques: winrate + intervalle de confiance de Wilson
-# - Classement Elo approximatif
-# - Matrice de confrontations
-# - Export CSV optionnel (désactivé par défaut)
+# Tournoi IA vs IA (sans interface) avec métriques utiles :
+#  - A est TOUJOURS Player1, B est TOUJOURS Player2
+#  - On alterne qui COMMENCE la partie (starter)
+#  - On affiche :
+#       * taux de victoire de A (+ intervalle de confiance 95%)
+#       * StartsWon(A) : victoires de A quand A commence
+#       * RepliesWon(A) : victoires de A quand B commence (A répond)
+#  - Résumé agrégé, ELO approximatif et matrice des confrontations
+#  - Détection et exclusion d’IA “muettes” (aucun coup au départ)
+#  - Export CSV laissé en commentaire (décommentez si besoin)
 # ----------------------------------------------------------
-
 from __future__ import annotations
-import importlib, pkgutil, pathlib, random, time, math, csv
-from typing import List, Dict, Tuple
+import time, math, random, threading
+from typing import List, Dict, Tuple, Optional
 from core.types import Shape, Player, Piece
 from core.rules import QuantikBoard
+import importlib, pkgutil, pathlib
 
-# =======================
-# Paramètres du tournoi
-# =======================
-GAMES_PER_PAIR = 50          # nb de parties par confrontation (au total A vs B)
-INCLUDE_SELF_PLAY = True     # True => inclure IA vs elle-même
-BASE_SEED = 42               # graine globale
-CSV_LOG = False              # True => export CSV, sinon laissé commenté plus bas
-CSV_PATH = "tournament_results.csv"
+# -------- Utilitaires plateau --------
+def raw_board(board: QuantikBoard):
+    """Retourne la matrice 4x4 (compatibilité : .raw() ou .board)."""
+    if hasattr(board, "raw"):
+        return board.raw()
+    return board.board
 
-# =======================
-# Découverte des IA
-# =======================
+def empty_position():
+    """Crée un plateau vide + stocks initiaux (pour tests/probes)."""
+    b = QuantikBoard()
+    pieces = {
+        Player.PLAYER1: {s: 2 for s in Shape},
+        Player.PLAYER2: {s: 2 for s in Shape},
+    }
+    return b, pieces
+
+# -------- Découverte des IA disponibles --------
 def discover_ais():
-    """Retourne une liste [{name, cls}] des IA trouvées."""
+    """
+    Cherche ai_players/*/algorithme.py, charge QuantikAI et AI_NAME.
+    Exclut 'template' par convention.
+    """
     base_pkg = "ai_players"
     base_path = pathlib.Path(__file__).resolve().parents[1] / base_pkg
     ais = []
+    errors = []
+
+    if not base_path.exists():
+        return [], ["(ai_players manquant)"]
+
     for pkg in pkgutil.iter_modules([str(base_path)]):
+        if pkg.name == "template":
+            continue  # on ignore le modèle
         mod_name = f"{base_pkg}.{pkg.name}.algorithme"
         try:
             mod = importlib.import_module(mod_name)
@@ -42,45 +58,67 @@ def discover_ais():
             ai_name = getattr(mod, "AI_NAME", pkg.name)
             if ai_cls:
                 ais.append({"name": ai_name, "cls": ai_cls})
+            else:
+                errors.append(f"{mod_name} (QuantikAI introuvable)")
         except Exception as e:
-            print(f"[AI DISCOVERY] Erreur pour {mod_name}: {e}")
+            errors.append(f"{mod_name} (erreur import: {e})")
+
     ais.sort(key=lambda x: x["name"].lower())
-    return ais
+    return ais, errors
 
-# =======================
-# Utilitaires statistiques
-# =======================
-def wilson_interval(k: int, n: int, z: float = 1.96) -> Tuple[float, float, float]:
-    """Intervalle de Wilson pour une proportion k/n (95% si z=1.96)."""
-    if n == 0:
-        return 0.0, 0.0, 0.0
-    phat = k / n
-    denom = 1 + z*z/n
-    center = (phat + z*z/(2*n)) / denom
-    margin = (z * math.sqrt((phat*(1-phat) + z*z/(4*n)) / n)) / denom
-    return phat, max(0.0, center - margin), min(1.0, center + margin)
-
-def expected_score(elo_a: float, elo_b: float) -> float:
-    return 1.0 / (1.0 + 10 ** ((elo_b - elo_a) / 400.0))
-
-def update_elo(elo_a: float, elo_b: float, score_a: float, k: float = 20.0) -> Tuple[float,float]:
-    ea = expected_score(elo_a, elo_b)
-    eb = 1.0 - ea
-    return elo_a + k*(score_a - ea), elo_b + k*((1.0 - score_a) - eb)
-
-# =======================
-# Moteur de match
-# =======================
-def play_one_game(aiA_cls, aiB_cls, first: Player = Player.PLAYER1, seed: int = None) -> Player:
+# -------- Probe rapide pour exclure IA “muettes” --------
+def probe_ai_speaks(ai_cls, timeout: float = 2.0) -> bool:
     """
-    Joue une partie:
-      - aiA = Player1, aiB = Player2 (peu importe 'first', on alterne le droit de commencer)
-      - 'first' indique qui joue le premier coup effectif
-      - on passe 'board.board' aux IA (compatible GUI)
+    Tente d’obtenir UN coup légal sur la position initiale.
+    Retourne True si l’IA propose un coup; False si None / timeout / exception.
     """
-    if seed is not None:
-        random.seed(seed)
+    b, pieces = empty_position()
+    board_raw = raw_board(b)
+    result_container = {"ok": False}
 
+    def worker():
+        try:
+            ai = ai_cls(Player.PLAYER1)
+            mv = ai.get_move(board_raw, pieces)
+            if mv is None:
+                result_container["ok"] = False
+                return
+            r, c, sh = mv
+            # Vérifie qu’on peut au moins tenter de jouer (pas besoin d’être parfait)
+            ok = b.place_piece(r, c, Piece(sh, Player.PLAYER1))
+            result_container["ok"] = bool(ok)
+        except Exception:
+            result_container["ok"] = False
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    t.join(timeout)
+    return result_container["ok"]
+
+def filter_mute_ais(ais, do_filter: bool = True):
+    """
+    Si do_filter=True, élimine les IA qui ne “parlent” pas au probe.
+    """
+    if not do_filter:
+        return ais, []
+    kept, excluded = [], []
+    for a in ais:
+        if probe_ai_speaks(a["cls"]):
+            kept.append(a)
+        else:
+            excluded.append(a["name"])
+    return kept, excluded
+
+# -------- Une partie IA vs IA --------
+def play_one_game(aiA_cls, aiB_cls, starter: Player) -> Tuple[Player, Dict[str,int]]:
+    """
+    A = Player1, B = Player2.
+    'starter' indique qui joue le PREMIER coup (peut être A (P1) ou B (P2)).
+    Renvoie (winner, stats_locaux) où stats_locaux inclut:
+      - 'A_started': 1 si A a commencé, sinon 0
+      - 'A_won_start': 1 si A a commencé et a gagné, sinon 0
+      - 'A_won_reply': 1 si B a commencé et A a gagné, sinon 0
+    """
     board = QuantikBoard()
     pieces = {
         Player.PLAYER1: {s: 2 for s in Shape},
@@ -89,140 +127,204 @@ def play_one_game(aiA_cls, aiB_cls, first: Player = Player.PLAYER1, seed: int = 
     aiA = aiA_cls(Player.PLAYER1)
     aiB = aiB_cls(Player.PLAYER2)
 
-    current = first
+    current = starter
+    A_started = 1 if starter == Player.PLAYER1 else 0
+    A_won_start = 0
+    A_won_reply = 0
+
     while True:
         ai = aiA if current == Player.PLAYER1 else aiB
-        # NOTE: si votre QuantikBoard expose board.raw(), remplacez ci-dessous par board.raw()
-        move = ai.get_move(board.board, pieces)
+        move = ai.get_move(raw_board(board), pieces)
         if not move:
             # pas de coup => l'autre gagne
-            return Player.PLAYER2 if current == Player.PLAYER1 else Player.PLAYER1
+            winner = Player.PLAYER2 if current == Player.PLAYER1 else Player.PLAYER1
+            if winner == Player.PLAYER1:
+                if A_started: A_won_start = 1
+                else:         A_won_reply = 1
+            return winner, {
+                "A_started": A_started,
+                "A_won_start": A_won_start,
+                "A_won_reply": A_won_reply,
+            }
 
         r, c, shape = move
         if not board.place_piece(r, c, Piece(shape, current)):
-            # coup invalide => défaite immédiate
-            return Player.PLAYER2 if current == Player.PLAYER1 else Player.PLAYER1
+            # coup invalide proposé => perd
+            winner = Player.PLAYER2 if current == Player.PLAYER1 else Player.PLAYER1
+            if winner == Player.PLAYER1:
+                if A_started: A_won_start = 1
+                else:         A_won_reply = 1
+            return winner, {
+                "A_started": A_started,
+                "A_won_start": A_won_start,
+                "A_won_reply": A_won_reply,
+            }
 
         pieces[current][shape] -= 1
         if board.check_victory():
-            return current
+            winner = current
+            if winner == Player.PLAYER1:
+                if A_started: A_won_start = 1
+                else:         A_won_reply = 1
+            return winner, {
+                "A_started": A_started,
+                "A_won_start": A_won_start,
+                "A_won_reply": A_won_reply,
+            }
 
-        # Alternance du joueur
         current = Player.PLAYER2 if current == Player.PLAYER1 else Player.PLAYER1
 
-def play_pair(iaA, iaB, games: int, base_seed: int) -> Tuple[int,int,float]:
-    """
-    Joue 'games' parties entre iaA et iaB, en alternant le premier joueur.
-    Retourne (winsA, winsB, elapsed_seconds).
-    """
+# -------- Statistiques / Affichages --------
+def wilson_interval(wins: int, total: int, z: float = 1.96) -> Tuple[float,float]:
+    if total == 0:
+        return (0.0, 0.0)
+    p = wins / total
+    denom = 1 + z*z/total
+    centre = p + z*z/(2*total)
+    margin = z * math.sqrt((p*(1-p)+z*z/(4*total))/total)
+    lo = (centre - margin)/denom
+    hi = (centre + margin)/denom
+    lo = max(0.0, lo)
+    hi = min(1.0, hi)
+    return lo, hi
+
+def elo_update(ra: float, rb: float, sa: float, k: float = 16.0) -> Tuple[float,float]:
+    """Mise à jour ELO simple, sa=1 si A gagne, 0 si A perd, 0.5 si nul (non utilisé ici)."""
+    ea = 1 / (1 + 10 ** ((rb - ra) / 400))
+    eb = 1 - ea
+    ra2 = ra + k * (sa - ea)
+    rb2 = rb + k * ((1 - sa) - eb)
+    return ra2, rb2
+
+# -------- Tournoi pairwise --------
+def run_pair(iaA: Dict, iaB: Dict, games: int = 50, seed: Optional[int] = None):
+    if seed is not None:
+        random.seed(seed)
+
+    Aname, Bname = iaA["name"], iaB["name"]
+    wA = wB = 0
+    A_starts_won = 0
+    A_replies_won = 0
+
     t0 = time.time()
-    winsA = winsB = 0
     for g in range(games):
-        first = Player.PLAYER1 if (g % 2 == 0) else Player.PLAYER2
-        # Seed reprod. dépendante des noms + index de partie
-        seed = (hash((iaA["name"], iaB["name"])) ^ (base_seed + g)) & 0x7FFFFFFF
-        winner = play_one_game(iaA["cls"], iaB["cls"], first, seed)
-        # Attribution: si winner == côté qui a "l'identité" de A ?
-        # Ici, A est toujours Player1 par construction du moteur play_one_game,
-        # mais 'first' peut être P1 ou P2. On s'en moque: winner est un Player.
+        # Alternance du starter : parties paires => A commence, impaires => B commence
+        starter = Player.PLAYER1 if (g % 2 == 0) else Player.PLAYER2
+        winner, loc = play_one_game(iaA["cls"], iaB["cls"], starter)
+
         if winner == Player.PLAYER1:
-            # Player1 est l'IA A
-            winsA += 1
+            wA += 1
+            A_starts_won  += loc["A_won_start"]
+            A_replies_won += loc["A_won_reply"]
         else:
-            winsB += 1
+            wB += 1
+
     elapsed = time.time() - t0
-    return winsA, winsB, elapsed
+    wr = wA / games if games > 0 else 0.0
+    lo, hi = wilson_interval(wA, games)
+    print(f"{Aname} vs {Bname} -> {wA}-{wB} sur {games} | "
+          f"WR(A)={wr:.3f} (95% CI: {lo:.3f}-{hi:.3f}) | "
+          f"StartsWon(A)={A_starts_won}, RepliesWon(A)={A_replies_won} | "
+          f"{elapsed:.1f}s")
 
-# =======================
-# Tournoi complet
-# =======================
-def main():
-    random.seed(BASE_SEED)
+    return {
+        "A": Aname, "B": Bname,
+        "wA": wA, "wB": wB, "games": games,
+        "wrA": wr, "ci_low": lo, "ci_high": hi,
+        "time": elapsed,
+        "A_starts_won": A_starts_won,
+        "A_replies_won": A_replies_won,
+    }
 
-    ais = discover_ais()
-    names = [a["name"] for a in ais]
-    print(f"IAs découvertes ({len(ais)}): {names}")
+def aggregate(results: List[Dict]):
+    # Totaux par IA
+    totals: Dict[str, Dict] = {}
+    for r in results:
+        for side in ("A", "B"):
+            name = r[side]
+            if name not in totals:
+                totals[name] = {"wins":0, "losses":0}
+        totals[r["A"]]["wins"]  += r["wA"]
+        totals[r["A"]]["losses"]+= r["wB"]
+        totals[r["B"]]["wins"]  += r["wB"]
+        totals[r["B"]]["losses"]+= r["wA"]
 
-    if CSV_LOG:
-        # Entête CSV (désactivez CSV_LOG=False si vous voulez réellement écrire le fichier)
-        with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["A", "B", "games", "winsA", "winsB", "wrA", "ci_low", "ci_high", "seconds"])
-
-    # Stats cumulées
-    agg = {a["name"]: {"W": 0, "L": 0} for a in ais}
-    # Elo
-    elo = {a["name"]: 1000.0 for a in ais}
-    # Matrice (A bat B)
-    matrix = {a["name"]: {b["name"]: (0,0) for b in ais} for a in ais}
-
-    # Boucle de confrontations (y compris self-play si demandé)
-    for i in range(len(ais)):
-        for j in range(len(ais)):
-            if i < j or (i == j and INCLUDE_SELF_PLAY):
-                A, B = ais[i], ais[j]
-                winsA, winsB, elapsed = play_pair(A, B, GAMES_PER_PAIR, BASE_SEED)
-
-                # Winrate + IC
-                wr, lo, hi = wilson_interval(winsA, winsA + winsB)
-
-                # Elo (mise à jour bilatérale, score = wins/total)
-                # NB: sur un batch, on peut faire une seule mise à jour agrégée
-                scoreA = winsA / max(1, (winsA + winsB))
-                elo[A["name"]], elo[B["name"]] = update_elo(elo[A["name"]], elo[B["name"]], scoreA, k=24.0)
-
-                # Agrégation
-                agg[A["name"]]["W"] += winsA
-                agg[A["name"]]["L"] += winsB
-                agg[B["name"]]["W"] += winsB
-                agg[B["name"]]["L"] += winsA
-
-                # Matrice
-                matrix[A["name"]][B["name"]] = (winsA, winsB)
-
-                # Affichage par duel
-                print(f"{A['name']} vs {B['name']} -> {winsA}-{winsB} sur {GAMES_PER_PAIR} "
-                      f"| WR(A)={wr:.3f} (95% CI: {lo:.3f}-{hi:.3f}) | {elapsed:.1f}s")
-
-                # CSV (optionnel)
-                if CSV_LOG:
-                    with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
-                        w = csv.writer(f)
-                        w.writerow([A["name"], B["name"], GAMES_PER_PAIR, winsA, winsB,
-                                    f"{wr:.3f}", f"{lo:.3f}", f"{hi:.3f}", f"{elapsed:.3f}"])
-
-    # Résumé agrégé
     print("\n=== Résumé agrégé par IA (winrate cumulé) ===")
-    rows = []
-    for name in names:
-        W, L = agg[name]["W"], agg[name]["L"]
-        wr, lo, hi = wilson_interval(W, W+L) if (W+L)>0 else (0.0,0.0,0.0)
-        rows.append((name, W, L, wr, lo, hi))
-    rows.sort(key=lambda x: x[3], reverse=True)
-    for (name, W, L, wr, lo, hi) in rows:
-        print(f"{name:<28} {W:>4}-{L:<4}  WR={wr:.3f}  (95% CI {lo:.3f}-{hi:.3f})")
+    lines = []
+    for name, t in totals.items():
+        w, l = t["wins"], t["losses"]
+        g = w + l
+        wr = w/g if g>0 else 0.0
+        lo, hi = wilson_interval(w, g)
+        lines.append((name, w, l, wr, lo, hi))
+    lines.sort(key=lambda x: x[3], reverse=True)
+    for (name, w, l, wr, lo, hi) in lines:
+        print(f"{name:28s} {w:4d}-{l:<4d}  WR={wr:.3f}  (95% CI {lo:.3f}-{hi:.3f})")
 
-    # Classement Elo (approx.)
+    # ELO approx. (round-robin, K fixe)
+    elo = {name: 1000.0 for name in totals.keys()}
+    for r in results:
+        A, B = r["A"], r["B"]
+        wA, wB = r["wA"], r["wB"]
+        for _ in range(wA): elo[A], elo[B] = elo_update(elo[A], elo[B], 1.0)
+        for _ in range(wB): elo[A], elo[B] = elo_update(elo[A], elo[B], 0.0)
+
     print("\n=== Classement ELO (approx.) ===")
-    for name, rating in sorted(elo.items(), key=lambda x: x[1], reverse=True):
-        print(f"{name:<26} ELO={rating:.1f}")
+    for name, rating in sorted(elo.items(), key=lambda kv: kv[1], reverse=True):
+        print(f"{name:28s} ELO={rating:.1f}")
 
-    # Matrice
+    # Matrice de confrontations
+    names = sorted(totals.keys())
+    idx = {n:i for i,n in enumerate(names)}
+    M = [[None for _ in names] for _ in names]
+    for r in results:
+        i, j = idx[r["A"]], idx[r["B"]]
+        M[i][j] = f"{r['wA']:>3d}-{r['wB']:<3d}"
+
     print("\n=== Matrice de confrontations (A bat B) ===")
-    # En-tête
-    header = "                         | " + " | ".join(f"{n[:12]:>12}" for n in names)
+    header = "                         | " + " | ".join(f"{n[:12]:>12s}" for n in names)
     print(header)
     print("-" * len(header))
-    for a in names:
-        line = f"{a[:25]:<25} | "
-        for b in names:
-            wA, wB = matrix[a][b]
-            if a == b and not INCLUDE_SELF_PLAY:
-                cell = "   —   "
-            else:
-                cell = f"{wA:>2}-{wB:<2}"
-            line += f"{cell:>12} | "
-        print(line)
+    for i, ni in enumerate(names):
+        row = f"{ni[:25]:<25} | "
+        row += " | ".join(f"{(M[i][j] or ''):>12s}" for j in range(len(names)))
+        print(row)
+
+    # ----- Export CSV (optionnel) -----
+    # Décommentez pour enregistrer un CSV détaillé.
+    # import csv
+    # with open("tournament_results.csv", "w", newline="", encoding="utf-8") as f:
+    #     w = csv.writer(f)
+    #     w.writerow(["A","B","wA","wB","games","wrA","ci_low","ci_high","time","A_starts_won","A_replies_won"])
+    #     for r in results:
+    #         w.writerow([r["A"], r["B"], r["wA"], r["wB"], r["games"], f"{r['wrA']:.3f}",
+    #                     f"{r['ci_low']:.3f}", f"{r['ci_high']:.3f}", f"{r['time']:.2f}",
+    #                     r["A_starts_won"], r["A_replies_won"]])
+
+def main():
+    # Paramètres du tournoi
+    GAMES_PER_PAIR = 100
+    SEED = 42      # fixez None pour tirage différent à chaque run
+    FILTER_MUTE = True  # exclure automatiquement les IA “muettes”
+    if SEED is not None:
+        random.seed(SEED)
+
+    ais, import_errors = discover_ais()
+    ais, mute_excluded = filter_mute_ais(ais, do_filter=FILTER_MUTE)
+
+    print(f"IAs découvertes ({len(ais)}): {[a['name'] for a in ais]}")
+    if import_errors:
+        print(f"⚠️  Erreurs d’import: {import_errors}")
+    if FILTER_MUTE and mute_excluded:
+        print(f"⚠️  Exclues (muettes au probe): {mute_excluded}")
+
+    results = []
+    for i in range(len(ais)):
+        for j in range(i+1, len(ais)):
+            r = run_pair(ais[i], ais[j], games=GAMES_PER_PAIR, seed=SEED)
+            results.append(r)
+
+    aggregate(results)
 
 if __name__ == "__main__":
     main()
