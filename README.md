@@ -41,6 +41,7 @@ quantik/
 Run the game with:
 ```bash
 python -m gui.app
+python3 -m gui.app
 ```
 Then select your AI in the dropdown menu and play against it.
 
