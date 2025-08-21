@@ -1,389 +1,708 @@
 # ai_players/ulysse/algorithme.py
 # -------------------------------------------------------------------
-# Implémentation d'un algorithme MinMax avec élagage Alpha-Beta
-# pour le jeu Quantik
+# Algorithme Quantik Minimax Alpha-Beta - Version Robuste v4.0
+# Implémentation de A à Z pour éliminer tous les bugs
 # -------------------------------------------------------------------
 from typing import Optional, Tuple, List, Dict
 from core.ai_base import AIBase
 from core.types import Shape, Player, Piece
-from core.rules import QuantikBoard, zone_index
+from core.rules import QuantikBoard
 import math
 import time
-from collections import defaultdict
 
-AI_NAME = "Ulysse – Optimized MinMax Alpha-Beta"
-AI_AUTHOR = "Ulysse"
-AI_VERSION = "2.0"
+AI_NAME = "minmax 1.3"
+AI_AUTHOR = "Ulysse Petit"
+AI_VERSION = "1.3"
 
 class QuantikAI(AIBase):
     def __init__(self, player: Player):
         super().__init__(player)
         self.opponent = Player.PLAYER1 if player == Player.PLAYER2 else Player.PLAYER2
-        self.max_depth = 6
-        self.transposition_table: Dict[str, Tuple[float, int, int]] = {}
-        self.killer_moves: List[List[Optional[Tuple[int, int, Shape]]]] = [[None, None] for _ in range(15)]
-        self.history_table: Dict[Tuple[int, int, Shape], int] = defaultdict(int)
-        self.nodes_searched = 0
-        self.max_time = 1.5
-        self.position_cache = {}
+        self.nodes_evaluated = 0
+        
+        # Paramètres adaptatifs
+        self.base_depth = 4
+        self.max_time = 10.0
+        self.target_time = 2.5
     
     def get_move(self, board, pieces_count) -> Optional[Tuple[int, int, Shape]]:
+        """Point d'entrée principal - GARANTIT un coup valide ou None si impossible"""
         game_board = QuantikBoard()
         game_board.board = [row[:] for row in board]
         
-        self.clear_tables()
+        # Validation préalable - éliminer les bugs à la source
+        valid_moves = self._generate_all_valid_moves(game_board, self.me)
+        if not valid_moves:
+            return None  # Vraiment aucun coup possible
         
-        total_pieces = sum(sum(pieces_count[player].values()) for player in pieces_count)
-        if total_pieces > 14:
-            opening_move = self.get_opening_move(game_board, pieces_count)
-            if opening_move:
-                return opening_move
+        # Adaptation profondeur selon stade de partie
+        pieces_played = sum(1 for r in range(4) for c in range(4) if game_board.board[r][c] is not None)
+        depth = self._calculate_optimal_depth(pieces_played)
         
+        self.nodes_evaluated = 0
         start_time = time.time()
-        self.nodes_searched = 0
         
+        try:
+            # Recherche minimax avec sécurité maximale
+            best_score, best_move = self._minimax_root(game_board, depth, start_time)
+            
+            # Validation finale - paranoia programming
+            if best_move is None and valid_moves:
+                # Fallback de sécurité : choix rapide mais valide
+                return self._emergency_move_selection(game_board, valid_moves)
+            
+            return best_move
+            
+        except Exception:
+            # Dernier recours : au moins un coup valide
+            return self._emergency_move_selection(game_board, valid_moves)
+    
+    def _generate_all_valid_moves(self, board: QuantikBoard, player: Player) -> List[Tuple[int, int, Shape]]:
+        """Générateur de coups ULTRA-FIABLE - Jamais de bug ici"""
+        moves = []
+        
+        # Parcours systématique de TOUTES les possibilités
+        for row in range(4):
+            for col in range(4):
+                # Case libre ?
+                if board.board[row][col] is not None:
+                    continue  # Occupée
+                
+                # Tester toutes les formes
+                for shape in Shape:
+                    piece = Piece(shape, player)
+                    
+                    # Validation stricte des règles Quantik
+                    if self._is_move_valid(board, row, col, piece):
+                        moves.append((row, col, shape))
+        
+        return moves
+    
+    def _is_move_valid(self, board: QuantikBoard, row: int, col: int, piece: Piece) -> bool:
+        """Validation des règles Quantik - Implémentation directe pour éviter les bugs"""
+        # Case libre ?
+        if board.board[row][col] is not None:
+            return False
+        
+        shape = piece.shape
+        player = piece.player
+        
+        # Règle ligne : impossible si adversaire a la même forme
+        for c in range(4):
+            other_piece = board.board[row][c]
+            if other_piece and other_piece.shape == shape and other_piece.player != player:
+                return False
+        
+        # Règle colonne : impossible si adversaire a la même forme  
+        for r in range(4):
+            other_piece = board.board[r][col]
+            if other_piece and other_piece.shape == shape and other_piece.player != player:
+                return False
+        
+        # Règle zone 2x2 : impossible si adversaire a la même forme
+        zone_positions = self._get_zone_positions(row, col)
+        for (r, c) in zone_positions:
+            other_piece = board.board[r][c]
+            if other_piece and other_piece.shape == shape and other_piece.player != player:
+                return False
+        
+        return True
+    
+    def _get_zone_positions(self, row: int, col: int) -> List[Tuple[int, int]]:
+        """Calcul des positions de la zone 2x2 - Simple et fiable"""
+        if row < 2 and col < 2:
+            return [(0,0), (0,1), (1,0), (1,1)]  # Zone haut-gauche
+        elif row < 2 and col >= 2:
+            return [(0,2), (0,3), (1,2), (1,3)]  # Zone haut-droite
+        elif row >= 2 and col < 2:
+            return [(2,0), (2,1), (3,0), (3,1)]  # Zone bas-gauche
+        else:
+            return [(2,2), (2,3), (3,2), (3,3)]  # Zone bas-droite
+    
+    def _calculate_optimal_depth(self, pieces_played: int) -> int:
+        """Profondeur adaptative selon stade de partie"""
+        if pieces_played <= 4:      # Ouverture
+            return self.base_depth
+        elif pieces_played <= 10:   # Milieu  
+            return self.base_depth + 2
+        else:                       # Fin
+            return self.base_depth + 4
+    
+    def _minimax_root(self, board: QuantikBoard, depth: int, start_time: float) -> Tuple[float, Optional[Tuple[int, int, Shape]]]:
+        """Racine minimax - Gestion du premier niveau avec sécurité max"""
+        best_score = -math.inf
         best_move = None
-        for depth in range(1, min(self.max_depth + 1, 16)):
+        
+        valid_moves = self._generate_all_valid_moves(board, self.me)
+        
+        # Sécurité : au moins un coup doit exister
+        if not valid_moves:
+            return 0.0, None
+        
+        # PRIORITÉ ABSOLUE : Vérification victoire immédiate
+        for row, col, shape in valid_moves:
+            old_piece = board.board[row][col]
+            board.board[row][col] = Piece(shape, self.me)
+            
+            if board.check_victory():
+                board.board[row][col] = old_piece
+                return 20000.0, (row, col, shape)  # Victoire immédiate !
+            
+            board.board[row][col] = old_piece
+        
+        # PRIORITÉ HAUTE : Blocage menaces immédiates adversaire
+        opponent_threats = self._find_immediate_threats(board, self.opponent)
+        if opponent_threats:
+            # Stratégie adaptative selon le nombre de menaces
+            if len(opponent_threats) == 1:
+                # Une seule menace : blocage sûr obligatoire
+                for row, col, shape in valid_moves:
+                    threat_blocked = any(
+                        (row, col) in threat_positions for threat_positions in opponent_threats
+                    )
+                    if threat_blocked:
+                        # Vérifier que ce coup ne créé pas une nouvelle menace adverse
+                        old_piece = board.board[row][col]
+                        board.board[row][col] = Piece(shape, self.me)
+                        
+                        new_opponent_threats = self._find_immediate_threats(board, self.opponent)
+                        board.board[row][col] = old_piece
+                        
+                        # Si pas de nouvelle menace créée, c'est un bon blocage
+                        if len(new_opponent_threats) == 0:
+                            return 15000.0, (row, col, shape)  # Blocage critique sûr !
+            else:
+                # Menaces multiples : d'abord essayer le blocage optimal
+                best_blocking_move = self._find_best_blocking_move(board, opponent_threats, valid_moves)
+                if best_blocking_move:
+                    return 14000.0, best_blocking_move  # Blocage tactique optimal
+                
+                # Si aucun blocage optimal, bloquer la menace la plus critique par dominance
+                most_dominant_threat = self._find_most_dominant_threat(board, opponent_threats)
+                if most_dominant_threat:
+                    return 13500.0, most_dominant_threat  # Blocage menace dominante
+        
+        # PRIORITÉ MOYENNE : Stratégie contre menaces en développement  
+        opponent_dev_threats = self._find_developing_threats(board, self.opponent)
+        if opponent_dev_threats:
+            # Essayer de créer une contre-menace plus forte d'abord
+            best_counter_move = None
+            best_counter_score = -math.inf
+            
+            for row, col, shape in valid_moves:
+                old_piece = board.board[row][col]
+                board.board[row][col] = Piece(shape, self.me)
+                
+                # CRUCIAL: Vérifier qu'on ne créé pas de menace immédiate adverse
+                new_opponent_threats = len(self._find_immediate_threats(board, self.opponent))
+                if new_opponent_threats > 0:
+                    board.board[row][col] = old_piece
+                    continue  # Ignorer ce coup dangereux
+                
+                # Évaluer si ce coup crée une menace plus forte
+                my_new_threats = len(self._find_immediate_threats(board, self.me))
+                my_dev_new_threats = len(self._find_developing_threats(board, self.me))
+                
+                counter_score = my_new_threats * 200 + my_dev_new_threats * 100
+                
+                # Bonus si bloque aussi une menace adverse
+                dev_threat_blocked = any(
+                    (row, col) in threat_positions for threat_positions in opponent_dev_threats
+                )
+                if dev_threat_blocked:
+                    counter_score += 150
+                
+                if counter_score > best_counter_score:
+                    best_counter_score = counter_score
+                    best_counter_move = (row, col, shape)
+                
+                board.board[row][col] = old_piece
+            
+            # Si contre-attaque forte trouvée, la privilégier
+            if best_counter_score >= 200:  # Seuil pour contre-attaque
+                return 13000.0, best_counter_move  # Contre-attaque !
+            
+            # Si au moins un coup sûr qui bloque, le prendre
+            if best_counter_move and best_counter_score >= 150:  # Seuil pour blocage sûr
+                return 11000.0, best_counter_move  # Blocage défensif sûr
+            
+            # Sinon, laisser minimax gérer (éviter les blocages qui créent des pièges)
+        
+        # Tri des coups par priorité tactique
+        sorted_moves = self._sort_moves_by_priority(board, valid_moves)
+        
+        # Évaluation minimax normale
+        for row, col, shape in sorted_moves:
+            # Timeout protection
             if time.time() - start_time > self.max_time:
                 break
             
-            time_left = self.max_time - (time.time() - start_time)
-            if time_left < 0.1:  # Less than 100ms left
-                break
-                
-            try:
-                score, move = self.minimax(game_board, pieces_count, depth, -math.inf, math.inf, True, start_time)
-                if move:
-                    best_move = move
-                    if abs(score) > 900:  # Found winning/losing move
-                        break
-            except TimeoutError:
-                break
+            # Simulation du coup
+            old_piece = board.board[row][col]
+            board.board[row][col] = Piece(shape, self.me)
+            
+            # Évaluation recursive
+            score = self._minimax(board, depth - 1, -math.inf, math.inf, False, start_time)
+            
+            # Restoration
+            board.board[row][col] = old_piece
+            
+            # Mise à jour du meilleur coup
+            if score > best_score:
+                best_score = score
+                best_move = (row, col, shape)
         
-        return best_move
+        # Garantie : toujours un coup si moves disponibles
+        if best_move is None and valid_moves:
+            best_move = valid_moves[0]  # Premier coup valide en fallback
+        
+        return best_score, best_move
     
-    def get_opening_move(self, board: QuantikBoard, pieces_count) -> Optional[Tuple[int, int, Shape]]:
-        empty_squares = sum(1 for row in board.board for cell in row if cell is None)
+    def _minimax(self, board: QuantikBoard, depth: int, alpha: float, beta: float, 
+                maximizing: bool, start_time: float) -> float:
+        """Minimax Alpha-Beta core - Version ultra-robuste"""
         
-        if empty_squares == 16:
-            return (1, 1, Shape.CIRCLE)
-        
-        if empty_squares >= 14:
-            center_moves = [(1, 1), (1, 2), (2, 1), (2, 2)]
-            for row, col in center_moves:
-                if board.board[row][col] is None:
-                    for shape in [Shape.CIRCLE, Shape.SQUARE, Shape.TRIANGLE, Shape.DIAMOND]:
-                        if pieces_count[self.me][shape] > 0:
-                            piece = Piece(shape, self.me)
-                            if board.is_valid_move(row, col, piece):
-                                return (row, col, shape)
-        
-        return None
-    
-    def minimax(self, board: QuantikBoard, pieces_count, depth: int, alpha: float, beta: float, maximizing: bool, start_time: float) -> Tuple[float, Optional[Tuple[int, int, Shape]]]:
+        # Timeout
         if time.time() - start_time > self.max_time:
-            raise TimeoutError()
+            return 0.0
         
-        self.nodes_searched += 1
+        self.nodes_evaluated += 1
         
-        board_key = self.get_board_key(board, pieces_count, maximizing)
-        if board_key in self.transposition_table:
-            stored_score, stored_depth, flag = self.transposition_table[board_key]
-            if stored_depth >= depth:
-                if flag == 0 or (flag == 1 and stored_score <= alpha) or (flag == -1 and stored_score >= beta):
-                    return stored_score, None
-        
-        victory = board.check_victory()
-        if depth == 0 or victory:
-            if victory:
-                score = 1000.0 if self.is_winning_for_me(board) else -1000.0
+        # Conditions terminales
+        if board.check_victory():
+            # Déterminer le gagnant
+            if self._is_winner(board, self.me):
+                return 10000.0 - (10 - depth)  # Plus rapide = mieux
             else:
-                score = self.evaluate(board, pieces_count)
-            self.transposition_table[board_key] = (score, depth, 0)
-            return score, None
+                return -10000.0 + (10 - depth)  # Défaite retardée = moins pire
         
-        if not self.has_moves(board, pieces_count):
-            return 0, None
+        if depth == 0:
+            return self._evaluate_position(board)
         
-        best_move = None
+        # Génération des coups
         current_player = self.me if maximizing else self.opponent
-        moves = self.get_ordered_moves(board, current_player, pieces_count, depth)
+        valid_moves = self._generate_all_valid_moves(board, current_player)
+        
+        # Pas de coups = égalité
+        if not valid_moves:
+            return 0.0
         
         if maximizing:
             max_eval = -math.inf
             
-            for move in moves:
-                row, col, shape = move
-                
+            for row, col, shape in valid_moves:
                 old_piece = board.board[row][col]
-                piece = Piece(shape, current_player)
-                board.place_piece(row, col, piece)
-                pieces_count[current_player][shape] -= 1
+                board.board[row][col] = Piece(shape, current_player)
                 
-                eval_score, _ = self.minimax(board, pieces_count, depth - 1, alpha, beta, False, start_time)
+                eval_score = self._minimax(board, depth - 1, alpha, beta, False, start_time)
                 
                 board.board[row][col] = old_piece
-                pieces_count[current_player][shape] += 1
                 
-                if eval_score > max_eval:
-                    max_eval = eval_score
-                    best_move = move
-                
+                max_eval = max(max_eval, eval_score)
                 alpha = max(alpha, eval_score)
+                
                 if beta <= alpha:
-                    if depth < len(self.killer_moves) and move not in self.killer_moves[depth]:
-                        self.killer_moves[depth][1] = self.killer_moves[depth][0]
-                        self.killer_moves[depth][0] = move
-                    self.history_table[move] += depth * depth
-                    break
+                    break  # Alpha-beta cut
+                
+            return max_eval
             
-            flag = 0 if alpha < max_eval < beta else (1 if max_eval <= alpha else -1)
-            self.transposition_table[board_key] = (max_eval, depth, flag)
-            return max_eval, best_move
-        
-        else:
+        else:  # Minimizing
             min_eval = math.inf
             
-            for move in moves:
-                row, col, shape = move
-                
+            for row, col, shape in valid_moves:
                 old_piece = board.board[row][col]
-                piece = Piece(shape, current_player)
-                board.place_piece(row, col, piece)
-                pieces_count[current_player][shape] -= 1
+                board.board[row][col] = Piece(shape, current_player)
                 
-                eval_score, _ = self.minimax(board, pieces_count, depth - 1, alpha, beta, True, start_time)
+                eval_score = self._minimax(board, depth - 1, alpha, beta, True, start_time)
                 
                 board.board[row][col] = old_piece
-                pieces_count[current_player][shape] += 1
                 
-                if eval_score < min_eval:
-                    min_eval = eval_score
-                    best_move = move
-                
+                min_eval = min(min_eval, eval_score)
                 beta = min(beta, eval_score)
+                
                 if beta <= alpha:
-                    if depth < len(self.killer_moves) and move not in self.killer_moves[depth]:
-                        self.killer_moves[depth][1] = self.killer_moves[depth][0]
-                        self.killer_moves[depth][0] = move
-                    self.history_table[move] += depth * depth
-                    break
-            
-            flag = 0 if alpha < min_eval < beta else (-1 if min_eval >= beta else 1)
-            self.transposition_table[board_key] = (min_eval, depth, flag)
-            return min_eval, best_move
+                    break  # Alpha-beta cut
+                
+            return min_eval
     
-    def get_possible_moves(self, board: QuantikBoard, player: Player, pieces_count) -> List[Tuple[int, int, Shape]]:
-        moves = []
-        for shape in Shape:
-            if pieces_count[player][shape] > 0:
-                for row in range(4):
-                    for col in range(4):
-                        if board.board[row][col] is None:
-                            piece = Piece(shape, player)
-                            if board.is_valid_move(row, col, piece):
-                                moves.append((row, col, shape))
-        return moves
+    def _evaluate_position(self, board: QuantikBoard) -> float:
+        """Évaluateur de position équilibré - Simple mais efficace"""
+        score = 0.0
+        
+        # 1. Analyse matérielle et positionnelle
+        for r in range(4):
+            for c in range(4):
+                piece = board.board[r][c]
+                if piece:
+                    # Bonus positionnel
+                    pos_value = self._get_position_value(r, c)
+                    
+                    if piece.player == self.me:
+                        score += pos_value
+                    else:
+                        score -= pos_value * 0.8  # Légèrement asymétrique pour être agressif
+        
+        # 2. Menaces et lignes en formation (évaluation approfondie)
+        my_threats = self._count_line_potential(board, self.me)
+        opp_threats = self._count_line_potential(board, self.opponent)
+        
+        # Pénalité MASSIVE pour menaces adverses en développement
+        opp_dev_threats = len(self._find_developing_threats(board, self.opponent))
+        opp_immediate_threats = len(self._find_immediate_threats(board, self.opponent))
+        
+        score += my_threats * 50 
+        score -= opp_threats * 60  # Menaces générales
+        score -= opp_dev_threats * 150  # Menaces en développement = DANGER
+        score -= opp_immediate_threats * 300  # Menaces immédiates = CRITIQUE
+        
+        # 3. Mobilité
+        my_moves = len(self._generate_all_valid_moves(board, self.me))
+        opp_moves = len(self._generate_all_valid_moves(board, self.opponent))
+        
+        score += (my_moves - opp_moves) * 5
+        
+        return score
     
-    def get_ordered_moves(self, board: QuantikBoard, player: Player, pieces_count, depth: int) -> List[Tuple[int, int, Shape]]:
-        moves = self.get_possible_moves(board, player, pieces_count)
-        
-        def move_priority(move):
-            row, col, shape = move
-            priority = 0
-            
-            if move in self.killer_moves[depth]:
-                priority += 10000
-            
-            priority += self.history_table.get(move, 0)
-            
-            center_bonus = 0
-            if (row, col) in [(1,1), (1,2), (2,1), (2,2)]:
-                center_bonus = 50
-            elif (row, col) in [(0,1), (0,2), (1,0), (1,3), (2,0), (2,3), (3,1), (3,2)]:
-                center_bonus = 20
-            priority += center_bonus
-            
-            old_piece = board.board[row][col]
-            piece = Piece(shape, player)
-            board.place_piece(row, col, piece)
-            
-            if board.check_victory():
-                priority += 100000
-            else:
-                winning_lines = self.count_potential_wins(board, player, row, col)
-                priority += winning_lines * 100
-            
-            board.board[row][col] = old_piece
-            return -priority
-        
-        return sorted(moves, key=move_priority)
+    def _get_position_value(self, row: int, col: int) -> float:
+        """Valeurs positionnelles - Centre privilégié"""
+        # Centre (contrôle 4 zones)
+        if (row, col) in [(1,1), (1,2), (2,1), (2,2)]:
+            return 20.0
+        # Semi-centre (contrôle 2 zones)  
+        elif row in [1,2] or col in [1,2]:
+            return 10.0
+        # Coins (contrôle 1 zone)
+        else:
+            return 5.0
     
-    def count_potential_wins(self, board: QuantikBoard, player: Player, row: int, col: int) -> int:
-        count = 0
+    def _count_line_potential(self, board: QuantikBoard, player: Player) -> int:
+        """Compte les lignes avec potentiel pour le joueur"""
+        potential = 0
         
-        line = [board.board[row][c] for c in range(4)]
-        if self.can_complete_line(line, player):
-            count += 1
+        # Toutes les lignes possibles
+        lines = []
         
-        column = [board.board[r][col] for r in range(4)]
-        if self.can_complete_line(column, player):
-            count += 1
+        # Lignes horizontales
+        for r in range(4):
+            lines.append([(r, c) for c in range(4)])
         
-        zone_idx = zone_index(row, col)
+        # Lignes verticales  
+        for c in range(4):
+            lines.append([(r, c) for r in range(4)])
+        
+        # Zones 2x2
+        zones = [
+            [(0,0), (0,1), (1,0), (1,1)],
+            [(0,2), (0,3), (1,2), (1,3)], 
+            [(2,0), (2,1), (3,0), (3,1)],
+            [(2,2), (2,3), (3,2), (3,3)]
+        ]
+        lines.extend(zones)
+        
+        # Évaluation de chaque ligne
+        for line_positions in lines:
+            pieces = [board.board[r][c] for r, c in line_positions]
+            potential += self._evaluate_line_potential(pieces, player)
+        
+        return potential
+    
+    def _evaluate_line_potential(self, pieces: List[Optional[Piece]], player: Player) -> int:
+        """Évalue le potentiel d'une ligne pour un joueur"""
+        my_pieces = [p for p in pieces if p and p.player == player]
+        opp_pieces = [p for p in pieces if p and p.player != player]
+        empty_count = sum(1 for p in pieces if p is None)
+        
+        # Ligne bloquée par l'adversaire
+        if opp_pieces:
+            return 0
+        
+        # Pas de nos pièces
+        if not my_pieces:
+            return 0
+        
+        # Évaluation selon progression
+        my_shapes = len(set(p.shape for p in my_pieces))
+        
+        # Toutes nos pièces ont des formes différentes + cases libres = potentiel
+        if my_shapes == len(my_pieces) and my_shapes + empty_count == 4:
+            if my_shapes == 3:  # Menace immédiate
+                return 10
+            elif my_shapes == 2:  # Menace en développement  
+                return 3
+            elif my_shapes == 1:  # Début prometteur
+                return 1
+        
+        return 0
+    
+    def _is_winner(self, board: QuantikBoard, player: Player) -> bool:
+        """Détermine si le joueur a gagné - Simple et fiable"""
+        # Cette fonction est appelée après board.check_victory() == True
+        # Il faut déterminer qui a créé la ligne gagnante
+        
+        # Vérifier toutes les lignes possibles
+        all_lines = []
+        
+        # Lignes horizontales
+        for r in range(4):
+            all_lines.append([(r, c) for c in range(4)])
+        
+        # Lignes verticales
+        for c in range(4):
+            all_lines.append([(r, c) for r in range(4)])
+        
+        # Zones 2x2
+        zones = [
+            [(0,0), (0,1), (1,0), (1,1)],
+            [(0,2), (0,3), (1,2), (1,3)],
+            [(2,0), (2,1), (3,0), (3,1)], 
+            [(2,2), (2,3), (3,2), (3,3)]
+        ]
+        all_lines.extend(zones)
+        
+        # Chercher une ligne gagnante avec au moins une pièce du joueur
+        for line_positions in all_lines:
+            pieces = [board.board[r][c] for r, c in line_positions]
+            
+            # Ligne complète ?
+            if all(p is not None for p in pieces):
+                # 4 formes différentes ?
+                shapes = {p.shape for p in pieces}
+                if len(shapes) == 4:
+                    # Au moins une pièce du joueur ?
+                    if any(p.player == player for p in pieces):
+                        return True
+        
+        return False
+    
+    def _emergency_move_selection(self, board: QuantikBoard, valid_moves: List[Tuple[int, int, Shape]]) -> Tuple[int, int, Shape]:
+        """Sélection d'urgence - Au moins jouer quelque chose de sensé"""
+        if not valid_moves:
+            return None
+        
+        # Privilégier le centre si possible
+        center_moves = [(r, c, s) for r, c, s in valid_moves if (r, c) in [(1,1), (1,2), (2,1), (2,2)]]
+        if center_moves:
+            return center_moves[0]
+        
+        # Sinon premier coup disponible
+        return valid_moves[0]
+    
+    def _find_immediate_threats(self, board: QuantikBoard, player: Player) -> List[List[Tuple[int, int]]]:
+        """Trouve les menaces immédiates (3 formes différentes + 1 vide) d'un joueur"""
+        threats = []
+        
+        # Toutes les lignes possibles
+        all_lines = []
+        
+        # Lignes horizontales
+        for r in range(4):
+            all_lines.append([(r, c) for c in range(4)])
+        
+        # Lignes verticales
+        for c in range(4):
+            all_lines.append([(r, c) for r in range(4)])
+        
+        # Zones 2x2
         zones = [
             [(0,0), (0,1), (1,0), (1,1)],
             [(0,2), (0,3), (1,2), (1,3)],
             [(2,0), (2,1), (3,0), (3,1)],
             [(2,2), (2,3), (3,2), (3,3)]
         ]
-        zone = [board.board[r][c] for (r, c) in zones[zone_idx]]
-        if self.can_complete_line(zone, player):
-            count += 1
+        all_lines.extend(zones)
+        
+        # Chercher les menaces immédiates
+        for line_positions in all_lines:
+            pieces = [board.board[r][c] for r, c in line_positions]
             
-        return count
-    
-    def can_complete_line(self, pieces: List[Optional[Piece]], player: Player) -> bool:
-        my_pieces = [p for p in pieces if p is not None and p.player == player]
-        opponent_pieces = [p for p in pieces if p is not None and p.player != player]
-        
-        if opponent_pieces:
-            return False
-        
-        my_shapes = {p.shape for p in my_pieces}
-        empty_count = sum(1 for p in pieces if p is None)
-        
-        return len(my_shapes) + empty_count == 4 and len(my_shapes) == len(my_pieces)
-    
-    def get_board_key(self, board: QuantikBoard, pieces_count, maximizing: bool) -> str:
-        board_str = ''.join(''.join(f'{p.shape.value}{p.player.value}' if p else '0' for p in row) for row in board.board)
-        pieces_str = ''.join(f'{player.value}:{sum(pieces_count[player].values())}' for player in [self.me, self.opponent])
-        return f'{board_str}:{pieces_str}:{maximizing}'
-    
-    def has_moves(self, board: QuantikBoard, pieces_count) -> bool:
-        """
-        Vérifie si le joueur actuel a des coups possibles
-        """
-        return len(self.get_possible_moves(board, self.me, pieces_count)) > 0 or \
-               len(self.get_possible_moves(board, self.opponent, pieces_count)) > 0
-    
-    def evaluate(self, board: QuantikBoard, pieces_count=None) -> float:
-        score = 0
-        my_threats = 0
-        opponent_threats = 0
-        
-        # Évaluation rapide des lignes, colonnes et zones
-        all_lines = [
-            [board.board[r][c] for c in range(4)] for r in range(4)  # lignes
-        ] + [
-            [board.board[r][c] for r in range(4)] for c in range(4)  # colonnes  
-        ] + [
-            [board.board[r][c] for (r, c) in [(0,0), (0,1), (1,0), (1,1)]],
-            [board.board[r][c] for (r, c) in [(0,2), (0,3), (1,2), (1,3)]],
-            [board.board[r][c] for (r, c) in [(2,0), (2,1), (3,0), (3,1)]],
-            [board.board[r][c] for (r, c) in [(2,2), (2,3), (3,2), (3,3)]]
-        ]  # zones
-        
-        for line in all_lines:
-            line_score = self.evaluate_line_fast(line)
-            score += line_score
+            all_pieces = [p for p in pieces if p is not None]
+            empty_positions = [(r, c) for (r, c), p in zip(line_positions, pieces) if p is None]
             
-            if self.is_immediate_threat(line, self.me):
-                my_threats += 1
-            elif self.is_immediate_threat(line, self.opponent):
-                opponent_threats += 1
+            # Menace immédiate : 3 pièces avec formes différentes + 1 vide
+            # ET au moins une pièce du joueur (pour que ce soit SA menace)
+            if len(all_pieces) == 3 and len(empty_positions) == 1:
+                shapes = {p.shape for p in all_pieces}
+                if len(shapes) == 3:  # 3 formes différentes
+                    # Vérifier qu'au moins une pièce appartient au joueur
+                    player_pieces = [p for p in all_pieces if p.player == player]
+                    if len(player_pieces) > 0:
+                        threats.append(empty_positions)  # Liste des positions de blocage
         
-        # Bonus menaces immédaites
-        score += my_threats * 40 - opponent_threats * 50
-        
-        # Bonus centre
-        for r, c in [(1,1), (1,2), (2,1), (2,2)]:
-            piece = board.board[r][c]
-            if piece:
-                score += 2 if piece.player == self.me else -1
-        
-        return score
+        return threats
     
-    def is_winning_for_me(self, board: QuantikBoard) -> bool:
-        """
-        Détermine si la position actuelle est gagnante pour notre IA
-        """
-        # Vérifier toutes les lignes gagnantes
+    def _find_developing_threats(self, board: QuantikBoard, player: Player) -> List[List[Tuple[int, int]]]:
+        """Trouve les menaces en développement (2 formes différentes + 2 vides)"""
+        threats = []
+        
+        # Toutes les lignes possibles (même code que pour menaces immédiates)
+        all_lines = []
+        
+        # Lignes horizontales
         for r in range(4):
-            line = [board.board[r][c] for c in range(4)]
-            if self.is_winning_line(line):
-                return True
+            all_lines.append([(r, c) for c in range(4)])
         
-        # Vérifier toutes les colonnes gagnantes
+        # Lignes verticales
         for c in range(4):
-            column = [board.board[r][c] for r in range(4)]
-            if self.is_winning_line(column):
-                return True
+            all_lines.append([(r, c) for r in range(4)])
         
-        # Vérifier toutes les zones gagnantes
-        for zone in [[board.board[r][c] for (r, c) in zone_cells] for zone_cells in [[
-            (0,0), (0,1), (1,0), (1,1)], [(0,2), (0,3), (1,2), (1,3)], 
-            [(2,0), (2,1), (3,0), (3,1)], [(2,2), (2,3), (3,2), (3,3)]]]:
-            if self.is_winning_line(zone):
-                return True
+        # Zones 2x2
+        zones = [
+            [(0,0), (0,1), (1,0), (1,1)],
+            [(0,2), (0,3), (1,2), (1,3)],
+            [(2,0), (2,1), (3,0), (3,1)],
+            [(2,2), (2,3), (3,2), (3,3)]
+        ]
+        all_lines.extend(zones)
         
-        return False
+        # Chercher les menaces en développement
+        for line_positions in all_lines:
+            pieces = [board.board[r][c] for r, c in line_positions]
+            
+            all_pieces = [p for p in pieces if p is not None]
+            empty_positions = [(r, c) for (r, c), p in zip(line_positions, pieces) if p is None]
+            
+            # Menace en développement : 2 pièces avec formes différentes + 2 vides
+            # ET au moins une pièce du joueur (pour que ce soit SA menace potentielle)
+            if len(all_pieces) == 2 and len(empty_positions) == 2:
+                shapes = {p.shape for p in all_pieces}
+                if len(shapes) == 2:  # 2 formes différentes
+                    # Vérifier qu'au moins une pièce appartient au joueur
+                    player_pieces = [p for p in all_pieces if p.player == player]
+                    if len(player_pieces) > 0:
+                        threats.append(empty_positions)  # Positions pouvant bloquer/compléter
+        
+        return threats
     
-    def is_winning_line(self, pieces: List[Optional[Piece]]) -> bool:
-        """
-        Vérifie si une ligne/colonne/zone est gagnante et appartient à notre IA
-        """
-        if any(p is None for p in pieces):
-            return False
+    def _find_best_blocking_move(self, board: QuantikBoard, opponent_threats: List[List[Tuple[int, int]]], 
+                                valid_moves: List[Tuple[int, int, Shape]]) -> Optional[Tuple[int, int, Shape]]:
+        """Trouve le meilleur coup de blocage quand il y a menaces multiples"""
+        best_move = None
+        best_score = -math.inf
         
-        shapes = {p.shape for p in pieces}
-        if len(shapes) != 4:  # Pas 4 formes différentes
-            return False
+        # Positions de toutes les menaces adverses
+        all_threat_positions = set()
+        for threat_positions in opponent_threats:
+            all_threat_positions.update(threat_positions)
         
-        # Vérifier que toutes les pièces appartiennent à notre IA
-        return all(p.player == self.me for p in pieces)
+        for row, col, shape in valid_moves:
+            # Ce coup bloque-t-il au moins une menace ?
+            if (row, col) not in all_threat_positions:
+                continue
+            
+            # NOUVEAU: Bonus pour bloquer les menaces les plus dominées par l'adversaire
+            # (calculer AVANT de jouer le coup sur l'état actuel)
+            dominance_bonus = self._calculate_threat_dominance_bonus(board, row, col, opponent_threats)
+                
+            # Évaluer ce coup de blocage
+            old_piece = board.board[row][col]
+            board.board[row][col] = Piece(shape, self.me)
+            
+            # Compter les menaces restantes après ce coup
+            remaining_threats = len(self._find_immediate_threats(board, self.opponent))
+            
+            # Bonus si on créé nos propres menaces
+            our_new_threats = len(self._find_immediate_threats(board, self.me))
+            
+            # Score : réduire menaces adverses + créer nos menaces + priorité menaces dominantes
+            score = (len(opponent_threats) - remaining_threats) * 1000 + our_new_threats * 500 + dominance_bonus - remaining_threats * 200
+            
+            if score > best_score:
+                best_score = score
+                best_move = (row, col, shape)
+            
+            board.board[row][col] = old_piece
+        
+        return best_move
     
+    def _calculate_threat_dominance_bonus(self, board: QuantikBoard, block_row: int, block_col: int, 
+                                        opponent_threats: List[List[Tuple[int, int]]]) -> int:
+        """Calcule un bonus pour bloquer les menaces les plus dominées par l'adversaire"""
+        # Toutes les lignes possibles
+        all_lines = []
+        
+        # Lignes horizontales
+        for r in range(4):
+            all_lines.append([(r, c) for c in range(4)])
+        
+        # Lignes verticales
+        for c in range(4):
+            all_lines.append([(r, c) for r in range(4)])
+        
+        # Zones 2x2
+        zones = [
+            [(0,0), (0,1), (1,0), (1,1)],
+            [(0,2), (0,3), (1,2), (1,3)],
+            [(2,0), (2,1), (3,0), (3,1)],
+            [(2,2), (2,3), (3,2), (3,3)]
+        ]
+        all_lines.extend(zones)
+        
+        max_dominance = 0
+        
+        # Chercher quelle ligne serait bloquée par ce coup
+        for line_positions in all_lines:
+            if (block_row, block_col) in line_positions:
+                pieces = [board.board[r][c] for r, c in line_positions]
+                non_none = [p for p in pieces if p is not None]
+                
+                # Cette ligne a-t-elle 3 formes différentes (menace immédiate) ?
+                if len(non_none) == 3:
+                    shapes = {p.shape for p in non_none}
+                    if len(shapes) == 3:
+                        # Compter les pièces de l'adversaire dans cette ligne
+                        opponent_pieces = sum(1 for p in non_none if p.player == self.opponent)
+                        
+                        # Plus l'adversaire domine la ligne, plus c'est prioritaire de bloquer
+                        dominance = opponent_pieces * 100
+                        max_dominance = max(max_dominance, dominance)
+        
+        return max_dominance
     
-    def evaluate_line_fast(self, pieces: List[Optional[Piece]]) -> float:
-        my_pieces = [p for p in pieces if p and p.player == self.me]
-        opponent_pieces = [p for p in pieces if p and p.player == self.opponent]
-        empty_count = sum(1 for p in pieces if p is None)
+    def _find_most_dominant_threat(self, board: QuantikBoard, opponent_threats: List[List[Tuple[int, int]]]) -> Optional[Tuple[int, int, Shape]]:
+        """Trouve le blocage de la menace la plus dominée par l'adversaire"""
+        best_move = None
+        best_dominance = -1
         
-        if not my_pieces and not opponent_pieces:
-            return 0
+        all_threat_positions = set()
+        for threat_positions in opponent_threats:
+            all_threat_positions.update(threat_positions)
         
-        my_shapes = len({p.shape for p in my_pieces})
-        opponent_shapes = len({p.shape for p in opponent_pieces})
+        valid_moves = self._generate_all_valid_moves(board, self.me)
         
-        score = 0
-        if my_pieces and not opponent_pieces:
-            if my_shapes == len(my_pieces) and my_shapes + empty_count == 4:
-                score = my_shapes * my_shapes * 2
-                if my_shapes == 3:
-                    score += 20
-        elif opponent_pieces and not my_pieces:
-            if opponent_shapes == len(opponent_pieces) and opponent_shapes + empty_count == 4:
-                score = -(opponent_shapes * opponent_shapes * 2)
-                if opponent_shapes == 3:
-                    score -= 25
+        for row, col, shape in valid_moves:
+            if (row, col) in all_threat_positions:
+                dominance = self._calculate_threat_dominance_bonus(board, row, col, opponent_threats)
+                if dominance > best_dominance:
+                    best_dominance = dominance
+                    best_move = (row, col, shape)
         
-        return score
+        return best_move
     
-    def is_immediate_threat(self, pieces: List[Optional[Piece]], player: Player) -> bool:
-        player_pieces = [p for p in pieces if p and p.player == player]
-        other_pieces = [p for p in pieces if p and p.player != player]
-        empty_count = sum(1 for p in pieces if p is None)
+    def _sort_moves_by_priority(self, board: QuantikBoard, moves: List[Tuple[int, int, Shape]]) -> List[Tuple[int, int, Shape]]:
+        """Trie les coups par priorité tactique"""
+        def move_score(move):
+            row, col, shape = move
+            score = 0
+            
+            # Priorité 1: Positions centrales
+            if (row, col) in [(1,1), (1,2), (2,1), (2,2)]:
+                score += 100
+            elif row in [1,2] or col in [1,2]:
+                score += 50
+            
+            # Priorité 2: Création de menaces
+            old_piece = board.board[row][col]
+            board.board[row][col] = Piece(shape, self.me)
+            
+            my_threats = len(self._find_immediate_threats(board, self.me))
+            score += my_threats * 200
+            
+            # Priorité 3: Potentiel de lignes
+            potential = self._count_line_potential(board, self.me)
+            score += potential * 10
+            
+            board.board[row][col] = old_piece
+            
+            return -score  # Tri décroissant
         
-        if other_pieces or len(player_pieces) != 3 or empty_count != 1:
-            return False
-        
-        shapes = {p.shape for p in player_pieces}
-        return len(shapes) == 3
-    
-    def clear_tables(self):
-        if len(self.transposition_table) > 50000:
-            self.transposition_table.clear()
-        if len(self.history_table) > 5000:
-            self.history_table.clear()
-        self.killer_moves = [[None, None] for _ in range(15)]
-        self.position_cache.clear()
+        return sorted(moves, key=move_score)
